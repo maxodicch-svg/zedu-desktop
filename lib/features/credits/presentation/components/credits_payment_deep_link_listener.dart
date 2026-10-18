@@ -22,7 +22,15 @@ class _CreditsPaymentDeepLinkListenerState
     extends ConsumerState<CreditsPaymentDeepLinkListener> {
   late final AppLinks _appLinks;
   StreamSubscription<Uri>? _linkSubscription;
-  String? _lastProcessedSessionId;
+
+  /// Set only once `verifyPayment` has actually run for this session.
+  String? _processedSessionId;
+
+  /// A payment session that arrived before the organisation was loaded.
+  String? _pendingSessionId;
+
+  /// Stops two deliveries of the same link racing into `verifyPayment`.
+  bool _verifying = false;
 
   static const _tag = 'CreditsPaymentDeepLinkListener';
 
@@ -53,35 +61,71 @@ class _CreditsPaymentDeepLinkListenerState
 
   Future<void> _handleUri(Uri uri) async {
     final sessionId = CreditsPaymentDeepLinkParser.extractSessionId(uri);
-    if (sessionId == null || sessionId == _lastProcessedSessionId) return;
-    _lastProcessedSessionId = sessionId;
-
-    final user = ref.read(authNotifierProvider).user;
-    final orgId = user?.currentOrg;
-    if (orgId == null || orgId.isEmpty) return;
-
-    AppLogger.i('Verifying credit payment session', tag: _tag);
-    final verified = await ref
-        .read(creditsNotifierProvider.notifier)
-        .verifyPayment(sessionId: sessionId, orgId: orgId);
-
-    if (!mounted) return;
-
-    if (verified) {
-      AppToastService.show(
-        context,
-        type: AppToastType.success,
-        message: 'AI credits purchased successfully!',
-      );
-      if (GoRouterState.of(context).uri.path != AppRouter.buyCredits) {
-        context.go(AppRouter.buyCredits);
-      }
+    if (sessionId == null) return;
+    if (sessionId == _processedSessionId || sessionId == _pendingSessionId) {
       return;
     }
 
-    final error = ref.read(creditsNotifierProvider).error;
-    if (error != null) {
-      AppToastService.show(context, type: AppToastType.error, message: error);
+    final orgId = ref.read(authNotifierProvider).user?.currentOrg;
+    if (orgId == null || orgId.isEmpty) {
+      // Cold start: this link launched the app, so auth has not resolved yet.
+      // Remember it rather than marking it processed and losing the payment.
+      _pendingSessionId = sessionId;
+      AppLogger.i(
+        'Deferring credit payment session until auth resolves',
+        tag: _tag,
+      );
+      return;
+    }
+
+    await _verifySession(sessionId: sessionId, orgId: orgId);
+  }
+
+  /// Picks up a deferred session as soon as the organisation exists.
+  void _drainPendingSession() {
+    final sessionId = _pendingSessionId;
+    if (sessionId == null) return;
+
+    final orgId = ref.read(authNotifierProvider).user?.currentOrg;
+    if (orgId == null || orgId.isEmpty) return;
+
+    _pendingSessionId = null;
+    unawaited(_verifySession(sessionId: sessionId, orgId: orgId));
+  }
+
+  Future<void> _verifySession({
+    required String sessionId,
+    required String orgId,
+  }) async {
+    if (_verifying || sessionId == _processedSessionId) return;
+    _verifying = true;
+    try {
+      AppLogger.i('Verifying credit payment session', tag: _tag);
+      final verified = await ref
+          .read(creditsNotifierProvider.notifier)
+          .verifyPayment(sessionId: sessionId, orgId: orgId);
+      _processedSessionId = sessionId;
+
+      if (!mounted) return;
+
+      if (verified) {
+        AppToastService.show(
+          context,
+          type: AppToastType.success,
+          message: 'AI credits purchased successfully!',
+        );
+        if (GoRouterState.of(context).uri.path != AppRouter.buyCredits) {
+          context.go(AppRouter.buyCredits);
+        }
+        return;
+      }
+
+      final error = ref.read(creditsNotifierProvider).error;
+      if (error != null) {
+        AppToastService.show(context, type: AppToastType.error, message: error);
+      }
+    } finally {
+      _verifying = false;
     }
   }
 
@@ -92,5 +136,9 @@ class _CreditsPaymentDeepLinkListenerState
   }
 
   @override
-  Widget build(BuildContext context) => widget.child;
+  Widget build(BuildContext context) {
+    // Auth resolving is what unblocks a deferred cold-start payment link.
+    ref.listen(authNotifierProvider, (_, __) => _drainPendingSession());
+    return widget.child;
+  }
 }
